@@ -1,119 +1,78 @@
-name: Windows - RustDesk Server
+name: Ubuntu - RustDesk Runner
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
 
 jobs:
-  rustdesk:
-    name: Start RustDesk Host (bounded)
-    runs-on: windows-latest
-    timeout-minutes: 240   # hard stop at 4 hours max
+  build:
+    name: Start RustDesk on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub max on Ubuntu is 360 mins
 
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
-
-      # ---- Optional: generate connection credentials (mask in logs) ----
       - name: Generate RustDesk credentials
-        shell: pwsh
+        id: creds
         run: |
-          # Random-ish ID and 12-char password
-          $id  = Get-Random -Minimum 100000 -Maximum 999999
-          $chs = (65..90) + (97..122) + (48..57) + 33,35,36,64
-          $pwd = -join (1..12 | ForEach-Object { [char] ($chs | Get-Random) })
+          set -e
+          ID=$((RANDOM%900000+100000))
+          PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
+          echo "RUSTDESK_ID=$ID"      | tee -a $GITHUB_ENV
+          echo "RUSTDESK_PASSWORD=$PASS" | tee -a $GITHUB_ENV
+          echo "✅ Credentials generated: ID=$ID  PASS=$PASS"
 
-          "RUSTDESK_ID=$id"        | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RUSTDESK_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          # Mask the password in all subsequent logs
-          echo "::add-mask::$pwd"
-
-      # ---- Install RustDesk (WinGet; fallback to Chocolatey) ----
-      - name: Install RustDesk (WinGet with fallback)
-        shell: pwsh
+      - name: Prepare system (deps)
         run: |
-          $env:WINGET_CONFIG_DISABLE_INTERACTIVITY = "1"
-          try {
-            winget --version
-            winget install --id RustDesk.RustDesk -e --accept-source-agreements --accept-package-agreements --source winget
-          } catch {
-            Write-Host "WinGet install failed; falling back to Chocolatey..."
-            Set-ExecutionPolicy Bypass -Scope Process -Force
-            if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-              Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-            }
-            choco install rustdesk -y --no-progress
-          }
+          sudo apt-get update
+          sudo apt-get install -y wget xvfb libgtk-3-0 libxcb-shape0 libxcb-xfixes0 libxkbcommon0 libx11-xcb1 libxcb1 libxi6 libxrandr2 libxcb-render0 libxcb-shm0
 
-      # ---- Find the actual rustdesk.exe path (don’t hard-code) ----
-      - name: Locate RustDesk executable
-        id: find_rustdesk
-        shell: pwsh
+      # If RustDesk version changes, just update the two variables below.
+      - name: Download RustDesk .deb
+        env:
+          RUSTDESK_VERSION: "1.2.3"          # <-- change if needed
+          RUSTDESK_DEB: "rustdesk-1.2.3-x86_64.deb"
         run: |
-          $candidates = @(
-            "C:\Program Files\RustDesk\*.exe",
-            "C:\Program Files (x86)\RustDesk\*.exe",
-            "$Env:LOCALAPPDATA\Programs\RustDesk\*.exe"
-          )
-          $exe = $null
-          foreach ($p in $candidates) {
-            $cand = Get-ChildItem $p -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^rustdesk.*\.exe$' } | Select-Object -First 1
-            if ($cand) { $exe = $cand.FullName; break }
-          }
-          if (-not $exe) {
-            $cand = Get-ChildItem -Recurse "$Env:LOCALAPPDATA\Programs" -Filter "rustdesk*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cand) { $exe = $cand.FullName }
-          }
-          if (-not $exe) { throw "RustDesk executable not found after install." }
-          "exe=$exe" | Out-File -FilePath $Env:GITHUB_OUTPUT -Append
-          Write-Host "Found RustDesk at: $exe"
+          set -e
+          URL="https://github.com/rustdesk/rustdesk/releases/download/${RUSTDESK_VERSION}/${RUSTDESK_DEB}"
+          echo "Downloading $URL"
+          wget -q "$URL" -O rustdesk.deb
 
-      # ---- Start RustDesk host (adjust args for your setup) ----
-      - name: Start RustDesk directly
-        shell: pwsh
+      - name: Install RustDesk
         run: |
-          $exe = '${{ steps.find_rustdesk.outputs.exe }}'
-          if (-not (Test-Path $exe)) { throw "Missing RustDesk exe at $exe" }
+          sudo dpkg -i rustdesk.deb || sudo apt-get -f install -y
+          rustdesk --version || true
+          echo "✅ RustDesk installed"
 
-          $work = Split-Path $exe
-          # Example host start; add/remove flags as needed for your environment.
-          $args = @("--host")
-          if ($env:RUSTDESK_ID)       { $args += @("--id", $env:RUSTDESK_ID) }
-          if ($env:RUSTDESK_PASSWORD) { $args += @("--password", $env:RUSTDESK_PASSWORD) }
-
-          Start-Process -FilePath $exe -ArgumentList $args -WorkingDirectory $work -PassThru | Out-Null
-          Write-Host "RustDesk started with args: $($args -join ' ')"
-
-      # ---- Save connection info without leaking the password in logs ----
-      - name: Save connection details (short-lived)
-        if: env.RUSTDESK_ID != '' || env.RUSTDESK_PASSWORD != ''
-        shell: pwsh
+      - name: Seed password & minimal config
         run: |
-          $path = "$env:RUNNER_TEMP\rustdesk-info.txt"
-          @"
-RustDesk executable: ${{ steps.find_rustdesk.outputs.exe }}
-RustDesk ID: $env:RUSTDESK_ID
-RustDesk Password: $env:RUSTDESK_PASSWORD
-(Password is masked in logs; retrieve from this artifact.)
-"@ | Out-File -FilePath $path -Encoding utf8
-          echo $path
+          mkdir -p ~/.config/rustdesk
+          cat > ~/.config/rustdesk/RustDesk.toml <<'EOF'
+          [options]
+          # Minimal headless-friendly options; adjust if you run your own hbbs/hbbr.
+          # enable_audio = false
+          # enable_file_transfer = false
+          EOF
+          # Store the password so RustDesk can auto-accept with it if needed
+          echo -n "${RUSTDESK_PASSWORD}" > ~/.config/rustdesk/password
+          chmod 600 ~/.config/rustdesk/password
 
-      - name: Upload connection details artifact
-        if: env.RUSTDESK_ID != '' || env.RUSTDESK_PASSWORD != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustdesk-info
-          path: ${{ runner.temp }}\rustdesk-info.txt
-          retention-days: 1
-
-      # ---- Keep the runner alive for a bounded time (no infinite loop) ----
-      - name: Keep alive for remote session (up to 3 hours)
-        shell: pwsh
+      - name: Start RustDesk (headless)
         run: |
-          $minutes = 180
-          for ($i=1; $i -le $minutes; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "⏱️  Minute $i / $minutes - $(Get-Date)"
-          }
+          # Launch under xvfb so GUI requirements are satisfied
+          nohup xvfb-run -a rustdesk >/tmp/rustdesk.log 2>&1 &
+          sleep 5
+          echo "=========================================="
+          echo "🚀 RUSTDESK RUNNER READY"
+          echo "ID: ${RUSTDESK_ID}"
+          echo "Password: ${RUSTDESK_PASSWORD}"
+          echo "=========================================="
+          echo "Logs tail (first 50 lines below):"
+          sleep 2
+          head -n 50 /tmp/rustdesk.log || true
+
+      - name: Keep alive
+        run: |
+          echo "🔄 Keeping the runner alive for remote access..."
+          for i in $(seq 1 20000); do
+            echo "✅ Alive - $(date)"
+            sleep 60
+          done
