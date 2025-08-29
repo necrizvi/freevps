@@ -1,78 +1,46 @@
-name: Ubuntu - RustDesk Runner
-
-on:
-  workflow_dispatch:
+name: Browser Desktop (noVNC)
+on: workflow_dispatch
 
 jobs:
-  build:
-    name: Start RustDesk on ubuntu-latest
+  desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # GitHub max on Ubuntu is 360 mins
-
     steps:
-      - name: Generate RustDesk credentials
-        id: creds
-        run: |
-          set -e
-          ID=$((RANDOM%900000+100000))
-          PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 10)
-          echo "RUSTDESK_ID=$ID"      | tee -a $GITHUB_ENV
-          echo "RUSTDESK_PASSWORD=$PASS" | tee -a $GITHUB_ENV
-          echo "✅ Credentials generated: ID=$ID  PASS=$PASS"
-
-      - name: Prepare system (deps)
+      - name: Install desktop + VNC + noVNC
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget xvfb libgtk-3-0 libxcb-shape0 libxcb-xfixes0 libxkbcommon0 libx11-xcb1 libxcb1 libxi6 libxrandr2 libxcb-render0 libxcb-shm0
+          sudo apt-get install -y xfce4 xfce4-terminal x11vnc xvfb websockify curl git
+          mkdir -p ~/.vnc
+          # set VNC password
+          x11vnc -storepasswd "changeme123" ~/.vnc/passwd
+          # get noVNC
+          git clone https://github.com/novnc/noVNC.git ~/noVNC
+          git clone https://github.com/novnc/websockify ~/noVNC/utils/websockify
 
-      # If RustDesk version changes, just update the two variables below.
-      - name: Download RustDesk .deb
-        env:
-          RUSTDESK_VERSION: "1.2.3"          # <-- change if needed
-          RUSTDESK_DEB: "rustdesk-1.2.3-x86_64.deb"
+      - name: Start X and desktop
         run: |
-          set -e
-          URL="https://github.com/rustdesk/rustdesk/releases/download/${RUSTDESK_VERSION}/${RUSTDESK_DEB}"
-          echo "Downloading $URL"
-          wget -q "$URL" -O rustdesk.deb
+          Xvfb :99 -screen 0 1280x800x24 &
+          export DISPLAY=:99
+          startxfce4 &
 
-      - name: Install RustDesk
+      - name: Start VNC and noVNC
         run: |
-          sudo dpkg -i rustdesk.deb || sudo apt-get -f install -y
-          rustdesk --version || true
-          echo "✅ RustDesk installed"
+          export DISPLAY=:99
+          x11vnc -rfbauth ~/.vnc/passwd -display :99 -forever -shared -rfbport 5901 -nopw -quiet &
+          ~/noVNC/utils/novnc_proxy --vnc localhost:5901 --listen 6080 &
 
-      - name: Seed password & minimal config
+      - name: Expose with Cloudflare tunnel
         run: |
-          mkdir -p ~/.config/rustdesk
-          cat > ~/.config/rustdesk/RustDesk.toml <<'EOF'
-          [options]
-          # Minimal headless-friendly options; adjust if you run your own hbbs/hbbr.
-          # enable_audio = false
-          # enable_file_transfer = false
-          EOF
-          # Store the password so RustDesk can auto-accept with it if needed
-          echo -n "${RUSTDESK_PASSWORD}" > ~/.config/rustdesk/password
-          chmod 600 ~/.config/rustdesk/password
-
-      - name: Start RustDesk (headless)
-        run: |
-          # Launch under xvfb so GUI requirements are satisfied
-          nohup xvfb-run -a rustdesk >/tmp/rustdesk.log 2>&1 &
-          sleep 5
-          echo "=========================================="
-          echo "🚀 RUSTDESK RUNNER READY"
-          echo "ID: ${RUSTDESK_ID}"
-          echo "Password: ${RUSTDESK_PASSWORD}"
-          echo "=========================================="
-          echo "Logs tail (first 50 lines below):"
-          sleep 2
-          head -n 50 /tmp/rustdesk.log || true
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:6080 --no-autoupdate 2>&1 | tee tunnel.log &
+          sleep 8
+          echo "----------------------------------------------------"
+          echo "Your noVNC URL(s):"
+          grep -oE 'https://[-a-z0-9]+\.trycloudflare\.com' tunnel.log | sort -u
+          echo "----------------------------------------------------"
+          echo "VNC password: vnc@4321"
+          echo "----------------------------------------------------"
 
       - name: Keep alive
         run: |
-          echo "🔄 Keeping the runner alive for remote access..."
-          for i in $(seq 1 20000); do
-            echo "✅ Alive - $(date)"
-            sleep 60
-          done
+          while true; do echo "alive $(date)"; sleep 60; done
