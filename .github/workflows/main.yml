@@ -11,7 +11,7 @@ jobs:
           sudo apt-get install -y xfce4 xfce4-terminal x11vnc xvfb websockify curl git
           mkdir -p ~/.vnc
           # set VNC password
-          x11vnc -storepasswd "changeme123" ~/.vnc/passwd
+          x11vnc -storepasswd "vnc@4321" ~/.vnc/passwd
           # get noVNC
           git clone https://github.com/novnc/noVNC.git ~/noVNC
           git clone https://github.com/novnc/websockify ~/noVNC/utils/websockify
